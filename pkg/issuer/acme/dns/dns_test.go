@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package dns
+package dns_test
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
@@ -27,9 +28,13 @@ import (
 	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
 	"github.com/jetstack/cert-manager/pkg/controller"
 	"github.com/jetstack/cert-manager/pkg/controller/test"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/acmedns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/cloudflare"
 	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/util"
+	. "github.com/jetstack/cert-manager/pkg/issuer/acme/dns"
+)
+
+
+import (
+	_ "github.com/jetstack/cert-manager/pkg/registrations"
 )
 
 func newIssuer(name, namespace string, configs []v1alpha1.ACMEIssuerDNS01Provider) *v1alpha1.Issuer {
@@ -60,6 +65,8 @@ func newSecret(name, namespace string, data map[string][]byte) *corev1.Secret {
 	}
 }
 func TestSolverFor(t *testing.T) {
+	acmedns:="acmedns"
+
 	type testT struct {
 		*solverFixture
 		domain             string
@@ -99,9 +106,12 @@ func TestSolverFor(t *testing.T) {
 						},
 					},
 				},
+				dnsProviders: &fakeDNSProviders{
+					providers: DefaultRegistry,
+				},
 			},
 			domain:             "example.com",
-			expectedSolverType: reflect.TypeOf(&cloudflare.DNSProvider{}),
+			expectedSolverType: DefaultRegistry.Get("cloudflare").ResolverType(),
 		},
 		"fails to load a cloudflare provider with a missing secret": {
 			solverFixture: &solverFixture{
@@ -237,9 +247,57 @@ func TestSolverFor(t *testing.T) {
 						},
 					},
 				},
+				dnsProviders: &fakeDNSProviders{
+					providers: DefaultRegistry,
+				},
 			},
 			domain:             "example.com",
-			expectedSolverType: reflect.TypeOf(&acmedns.DNSProvider{}),
+			expectedSolverType: DefaultRegistry.Get("acmedns").ResolverType(),
+		},
+		"loads json for acmedns provider with generic config": {
+			solverFixture: &solverFixture{
+				Builder: &test.Builder{
+					KubeObjects: []runtime.Object{
+						newSecret("acmedns-key", "default", map[string][]byte{
+							"acmedns.json": []byte("{}"),
+						}),
+					},
+				},
+				Issuer: newIssuer("test", "default", []v1alpha1.ACMEIssuerDNS01Provider{
+					{
+						Name: "fake-acmedns",
+						Kind: &acmedns,
+						ProviderConfig: &runtime.RawExtension{
+							Raw: func() []byte {
+								bytes, _ := json.Marshal(&v1alpha1.ACMEIssuerDNS01ProviderAcmeDNS{
+									Host: "http://127.0.0.1/",
+									AccountSecret: v1alpha1.SecretKeySelector{
+										LocalObjectReference: v1alpha1.LocalObjectReference{
+											Name: "acmedns-key",
+										},
+										Key: "acmedns.json",
+									},
+								})
+								return bytes
+							}(),
+						},
+					},
+				}),
+				Challenge: &v1alpha1.Challenge{
+					Spec: v1alpha1.ChallengeSpec{
+						Config: v1alpha1.SolverConfig{
+							DNS01: &v1alpha1.DNS01SolverConfig{
+								Provider: "fake-acmedns",
+							},
+						},
+					},
+				},
+				dnsProviders: &fakeDNSProviders{
+					providers: DefaultRegistry,
+				},
+			},
+			domain:             "example.com",
+			expectedSolverType: DefaultRegistry.Get("acmedns").ResolverType(),
 		},
 	}
 	testFn := func(test testT) func(*testing.T) {
@@ -247,7 +305,7 @@ func TestSolverFor(t *testing.T) {
 			test.Setup(t)
 			defer test.Finish(t)
 			s := test.Solver
-			dnsSolver, _, err := s.solverForChallenge(test.Issuer, test.Challenge)
+			dnsSolver, _, err := SolverForChallenge(s, test.Issuer, test.Challenge)
 			if err != nil && !test.expectErr {
 				t.Errorf("expected solverFor to not error, but got: %s", err.Error())
 				return
@@ -302,7 +360,7 @@ func TestSolveForDigitalOcean(t *testing.T) {
 	defer f.Finish(t)
 
 	s := f.Solver
-	_, _, err := s.solverForChallenge(f.Issuer, f.Challenge)
+	_, _, err := SolverForChallenge(s,f.Issuer, f.Challenge)
 	if err != nil {
 		t.Fatalf("expected solverFor to not error, but got: %s", err)
 	}
@@ -360,7 +418,7 @@ func TestRoute53TrimCreds(t *testing.T) {
 	defer f.Finish(t)
 
 	s := f.Solver
-	_, _, err := s.solverForChallenge(f.Issuer, f.Challenge)
+	_, _, err := SolverForChallenge(s,f.Issuer, f.Challenge)
 	if err != nil {
 		t.Fatalf("expected solverFor to not error, but got: %s", err)
 	}
@@ -464,7 +522,7 @@ func TestRoute53AmbientCreds(t *testing.T) {
 		f.Setup(t)
 		defer f.Finish(t)
 		s := f.Solver
-		_, _, err := s.solverForChallenge(f.Issuer, f.Challenge)
+		_, _, err := SolverForChallenge(s,f.Issuer, f.Challenge)
 		if !reflect.DeepEqual(tt.out.expectedErr, err) {
 			t.Fatalf("expected error %v, got error %v", tt.out.expectedErr, err)
 		}

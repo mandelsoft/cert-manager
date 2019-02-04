@@ -607,7 +607,7 @@ func TestValidateACMEIssuerDNS01Config(t *testing.T) {
 				},
 			},
 			errs: []*field.Error{
-				field.Forbidden(providersPath.Index(0).Child("cloudflare"), "may not specify more than one provider type"),
+				field.Forbidden(providersPath.Index(0), "may not specify more than one provider type"),
 			},
 		},
 	}

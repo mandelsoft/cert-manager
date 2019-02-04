@@ -1423,6 +1423,7 @@
     "github.com/gorilla/mux",
     "github.com/hashicorp/vault/api",
     "github.com/hashicorp/vault/helper/certutil",
+    "github.com/json-iterator/go",
     "github.com/kr/pretty",
     "github.com/miekg/dns",
     "github.com/onsi/ginkgo",

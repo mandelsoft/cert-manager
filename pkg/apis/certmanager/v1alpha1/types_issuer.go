@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // +genclient
@@ -171,6 +172,9 @@ type ACMEIssuerDNS01Provider struct {
 	DigitalOcean *ACMEIssuerDNS01ProviderDigitalOcean `json:"digitalocean,omitempty"`
 	AcmeDNS      *ACMEIssuerDNS01ProviderAcmeDNS      `json:"acmedns,omitempty"`
 	RFC2136      *ACMEIssuerDNS01ProviderRFC2136      `json:"rfc2136,omitempty"`
+
+	Kind           *string               `json:"kind,omitempty"`
+	ProviderConfig *runtime.RawExtension `json:"providerConfig,omitempty"`
 }
 
 // CNAMEStrategy configures how the DNS01 provider should handle CNAME records

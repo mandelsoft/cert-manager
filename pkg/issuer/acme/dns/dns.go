@@ -19,23 +19,15 @@ package dns
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
 	"github.com/jetstack/cert-manager/pkg/controller"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/acmedns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/akamai"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/azuredns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/clouddns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/cloudflare"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/digitalocean"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/rfc2136"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/route53"
 	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/util"
 )
 
@@ -48,26 +40,13 @@ type solver interface {
 	CleanUp(domain, fqdn, value string) error
 }
 
-// dnsProviderConstructors defines how each provider may be constructed.
-// It is useful for mocking out a given provider since an alternate set of
-// constructors may be set.
-type dnsProviderConstructors struct {
-	cloudDNS     func(project string, serviceAccount []byte, dns01Nameservers []string, ambient bool) (*clouddns.DNSProvider, error)
-	cloudFlare   func(email, apikey string, dns01Nameservers []string) (*cloudflare.DNSProvider, error)
-	route53      func(accessKey, secretKey, hostedZoneID, region string, ambient bool, dns01Nameservers []string) (*route53.DNSProvider, error)
-	azureDNS     func(clientID, clientSecret, subscriptionID, tenentID, resourceGroupName, hostedZoneName string, dns01Nameservers []string) (*azuredns.DNSProvider, error)
-	acmeDNS      func(host string, accountJson []byte, dns01Nameservers []string) (*acmedns.DNSProvider, error)
-	rfc2136      func(nameserver, tsigAlgorithm, tsigKeyName, tsigSecret string, dns01Nameservers []string) (*rfc2136.DNSProvider, error)
-	digitalOcean func(token string, dns01Nameservers []string) (*digitalocean.DNSProvider, error)
-}
-
 // Solver is a solver for the acme dns01 challenge.
 // Given a Certificate object, it determines the correct DNS provider based on
 // the certificate, and configures it based on the referenced issuer.
 type Solver struct {
 	*controller.Context
-	secretLister            corev1listers.SecretLister
-	dnsProviderConstructors dnsProviderConstructors
+	secretLister corev1listers.SecretLister
+	providers    *Registry
 }
 
 // Present performs the work to configure DNS to resolve a DNS01 challenge.
@@ -148,7 +127,6 @@ func followCNAME(strategy v1alpha1.CNAMEStrategy) bool {
 // specified on the Issuer resource for the Solver.
 func (s *Solver) solverForChallenge(issuer v1alpha1.GenericIssuer, ch *v1alpha1.Challenge) (solver, *v1alpha1.ACMEIssuerDNS01Provider, error) {
 	resourceNamespace := s.ResourceNamespace(issuer)
-	canUseAmbientCredentials := s.CanUseAmbientCredentials(issuer)
 
 	providerName := ch.Spec.Config.DNS01.Provider
 	if providerName == "" {
@@ -161,178 +139,59 @@ func (s *Solver) solverForChallenge(issuer v1alpha1.GenericIssuer, ch *v1alpha1.
 	}
 
 	var impl solver
+	var kind string
+	var config interface{}
 	switch {
 	case providerConfig.Akamai != nil:
-		clientToken, err := s.loadSecretData(&providerConfig.Akamai.ClientToken, resourceNamespace)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "error getting akamai client token")
-		}
+		kind="akamai"
+		config=providerConfig.Akamai
 
-		clientSecret, err := s.loadSecretData(&providerConfig.Akamai.ClientSecret, resourceNamespace)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "error getting akamai client secret")
-		}
-
-		accessToken, err := s.loadSecretData(&providerConfig.Akamai.AccessToken, resourceNamespace)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "error getting akamai access token")
-		}
-
-		impl, err = akamai.NewDNSProvider(
-			providerConfig.Akamai.ServiceConsumerDomain,
-			string(clientToken),
-			string(clientSecret),
-			string(accessToken),
-			s.DNS01Nameservers)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "error instantiating akamai challenge solver")
-		}
 	case providerConfig.CloudDNS != nil:
-		var keyData []byte
+		kind="clouddns"
+		config=providerConfig.CloudDNS
 
-		// if the serviceAccount.name field is set, we will load credentials from
-		// that secret.
-		// If it is not set, we will attempt to instantiate the provider using
-		// ambient credentials (if enabled).
-		if providerConfig.CloudDNS.ServiceAccount.Name != "" {
-			saSecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.CloudDNS.ServiceAccount.Name)
-			if err != nil {
-				return nil, nil, fmt.Errorf("error getting clouddns service account: %s", err)
-			}
-
-			saKey := providerConfig.CloudDNS.ServiceAccount.Key
-			keyData = saSecret.Data[saKey]
-			if len(keyData) == 0 {
-				return nil, nil, fmt.Errorf("specfied key %q not found in secret %s/%s", saKey, saSecret.Namespace, saSecret.Name)
-			}
-		}
-
-		// attempt to construct the cloud dns provider
-		impl, err = s.dnsProviderConstructors.cloudDNS(providerConfig.CloudDNS.Project, keyData, s.DNS01Nameservers, s.CanUseAmbientCredentials(issuer))
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating google clouddns challenge solver: %s", err)
-		}
 	case providerConfig.Cloudflare != nil:
-		apiKeySecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.Cloudflare.APIKey.Name)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error getting cloudflare service account: %s", err)
-		}
+		kind="cloudflare"
+		config=providerConfig.Cloudflare
 
-		email := providerConfig.Cloudflare.Email
-		apiKey := string(apiKeySecret.Data[providerConfig.Cloudflare.APIKey.Key])
-
-		impl, err = s.dnsProviderConstructors.cloudFlare(email, apiKey, s.DNS01Nameservers)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating cloudflare challenge solver: %s", err)
-		}
 	case providerConfig.DigitalOcean != nil:
-		apiTokenSecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.DigitalOcean.Token.Name)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error getting digitalocean token: %s", err)
-		}
+		kind="digitalocean"
+		config=providerConfig.DigitalOcean
 
-		apiToken := string(apiTokenSecret.Data[providerConfig.DigitalOcean.Token.Key])
-
-		impl, err = s.dnsProviderConstructors.digitalOcean(strings.TrimSpace(apiToken), s.DNS01Nameservers)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating digitalocean challenge solver: %s", err.Error())
-		}
 	case providerConfig.Route53 != nil:
-		secretAccessKey := ""
-		if providerConfig.Route53.SecretAccessKey.Name != "" {
-			secretAccessKeySecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.Route53.SecretAccessKey.Name)
-			if err != nil {
-				return nil, nil, fmt.Errorf("error getting route53 secret access key: %s", err)
-			}
+		kind="route53"
+		config=providerConfig.Route53
 
-			secretAccessKeyBytes, ok := secretAccessKeySecret.Data[providerConfig.Route53.SecretAccessKey.Key]
-			if !ok {
-				return nil, nil, fmt.Errorf("error getting route53 secret access key: key '%s' not found in secret", providerConfig.Route53.SecretAccessKey.Key)
-			}
-			secretAccessKey = string(secretAccessKeyBytes)
-		}
-
-		impl, err = s.dnsProviderConstructors.route53(
-			strings.TrimSpace(providerConfig.Route53.AccessKeyID),
-			strings.TrimSpace(secretAccessKey),
-			providerConfig.Route53.HostedZoneID,
-			providerConfig.Route53.Region,
-			canUseAmbientCredentials,
-			s.DNS01Nameservers,
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating route53 challenge solver: %s", err)
-		}
 	case providerConfig.AzureDNS != nil:
-		clientSecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.AzureDNS.ClientSecret.Name)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error getting azuredns client secret: %s", err)
-		}
+		kind="azuredns"
+		config=providerConfig.AzureDNS
 
-		clientSecretBytes, ok := clientSecret.Data[providerConfig.AzureDNS.ClientSecret.Key]
-		if !ok {
-			return nil, nil, fmt.Errorf("error getting azure dns client secret: key '%s' not found in secret", providerConfig.AzureDNS.ClientSecret.Key)
-		}
-
-		impl, err = s.dnsProviderConstructors.azureDNS(
-			providerConfig.AzureDNS.ClientID,
-			string(clientSecretBytes),
-			providerConfig.AzureDNS.SubscriptionID,
-			providerConfig.AzureDNS.TenantID,
-			providerConfig.AzureDNS.ResourceGroupName,
-			providerConfig.AzureDNS.HostedZoneName,
-			s.DNS01Nameservers,
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating azuredns challenge solver: %s", err)
-		}
 	case providerConfig.AcmeDNS != nil:
-		accountSecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.AcmeDNS.AccountSecret.Name)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error getting acmedns accounts secret: %s", err)
-		}
+		kind="acmedns"
+		config=providerConfig.AcmeDNS
 
-		accountSecretBytes, ok := accountSecret.Data[providerConfig.AcmeDNS.AccountSecret.Key]
-		if !ok {
-			return nil, nil, fmt.Errorf("error getting acmedns accounts secret: key '%s' not found in secret", providerConfig.AcmeDNS.AccountSecret.Key)
-		}
-
-		impl, err = s.dnsProviderConstructors.acmeDNS(
-			providerConfig.AcmeDNS.Host,
-			accountSecretBytes,
-			s.DNS01Nameservers,
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating acmedns challenge solver: %s", err)
-		}
 	case providerConfig.RFC2136 != nil:
-		var secret string
-		if len(providerConfig.RFC2136.TSIGSecret.Name) > 0 {
-			tsigSecret, err := s.secretLister.Secrets(resourceNamespace).Get(providerConfig.RFC2136.TSIGSecret.Name)
-			if err != nil {
-				return nil, nil, fmt.Errorf("error getting rfc2136 service account: %s", err.Error())
-			}
-			secretBytes, ok := tsigSecret.Data[providerConfig.RFC2136.TSIGSecret.Key]
-			if !ok {
-				return nil, nil, fmt.Errorf("error getting rfc2136 secret key: key '%s' not found in secret", providerConfig.RFC2136.TSIGSecret.Key)
-			}
-			secret = string(secretBytes)
-		}
+		kind="rfc2136"
+		config=providerConfig.RFC2136
 
-		impl, err = s.dnsProviderConstructors.rfc2136(
-			providerConfig.RFC2136.Nameserver,
-			string(providerConfig.RFC2136.TSIGAlgorithm),
-			providerConfig.RFC2136.TSIGKeyName,
-			secret,
-			s.DNS01Nameservers,
-		)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error instantiating rfc2136 challenge solver: %s", err.Error())
-		}
 	default:
-		return nil, nil, fmt.Errorf("no dns provider config specified for provider %q", providerName)
+		if providerConfig.Kind!=nil && *providerConfig.Kind!="" {
+			kind=*providerConfig.Kind
+			config=providerConfig.ProviderConfig
+		} else {
+			return nil, nil, fmt.Errorf("no dns provider config specified for provider %q", providerName)
+		}
 	}
 
+	factory:=s.providers.Get(kind)
+	if factory==nil {
+		return nil, nil, fmt.Errorf("unknown provider kind %q configured for provider %q", kind, providerName)
+	}
+	impl, err = factory.Create(s,issuer,ch, resourceNamespace, config)
+
+	if err != nil {
+	    return nil, nil, err
+	}
 	return impl, providerConfig, nil
 }
 
@@ -342,19 +201,15 @@ func NewSolver(ctx *controller.Context) *Solver {
 	return &Solver{
 		ctx,
 		ctx.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
-		dnsProviderConstructors{
-			clouddns.NewDNSProvider,
-			cloudflare.NewDNSProviderCredentials,
-			route53.NewDNSProvider,
-			azuredns.NewDNSProviderCredentials,
-			acmedns.NewDNSProviderHostBytes,
-			rfc2136.NewDNSProviderCredentials,
-			digitalocean.NewDNSProviderCredentials,
-		},
+		DefaultRegistry,
 	}
 }
 
-func (s *Solver) loadSecretData(selector *v1alpha1.SecretKeySelector, ns string) ([]byte, error) {
+func (s *Solver) Secret(namespace, name string) (*corev1.Secret, error) {
+	return s.secretLister.Secrets(namespace).Get(name)
+}
+
+func (s *Solver) LoadSecretData(selector *v1alpha1.SecretKeySelector, ns string) ([]byte, error) {
 	secret, err := s.secretLister.Secrets(ns).Get(selector.Name)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to load secret %q", ns+"/"+selector.Name)

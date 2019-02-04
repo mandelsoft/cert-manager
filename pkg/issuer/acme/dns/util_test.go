@@ -14,25 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package dns
+package dns_test
 
 import (
-	"errors"
+	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/digitalocean"
+	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/route53"
+	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/util"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"reflect"
 	"testing"
 
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/digitalocean"
 
 	"github.com/jetstack/cert-manager/test/util/generate"
 
 	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1alpha1"
 	"github.com/jetstack/cert-manager/pkg/controller/test"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/acmedns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/azuredns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/clouddns"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/cloudflare"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/rfc2136"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/route53"
-	"github.com/jetstack/cert-manager/pkg/issuer/acme/dns/util"
+	. "github.com/jetstack/cert-manager/pkg/issuer/acme/dns"
 )
 
 const (
@@ -86,7 +83,7 @@ func (s *solverFixture) Setup(t *testing.T) {
 	if s.dnsProviders == nil {
 		s.dnsProviders = newFakeDNSProviders()
 	}
-	s.Solver = buildFakeSolver(s.Builder, s.dnsProviders.constructors)
+	s.Solver = buildFakeSolver(s.Builder, s.dnsProviders.providers)
 	if s.PreFn != nil {
 		s.PreFn(t, s)
 		s.Builder.Sync()
@@ -103,13 +100,13 @@ func (s *solverFixture) Finish(t *testing.T, args ...interface{}) {
 	}
 }
 
-func buildFakeSolver(b *test.Builder, dnsProviders dnsProviderConstructors) *Solver {
+func buildFakeSolver(b *test.Builder, dnsProviders *Registry) *Solver {
 	b.Start()
-	s := &Solver{
-		Context:                 b.Context,
-		secretLister:            b.Context.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
-		dnsProviderConstructors: dnsProviders,
-	}
+	s := NewSolver2(
+		 b.Context,
+		 b.Context.KubeSharedInformerFactory.Core().V1().Secrets().Lister(),
+		 dnsProviders,
+		)
 	b.Sync()
 	return s
 }
@@ -124,7 +121,7 @@ type fakeDNSProviderCall struct {
 }
 
 type fakeDNSProviders struct {
-	constructors dnsProviderConstructors
+	providers    *Registry
 	calls        []fakeDNSProviderCall
 }
 
@@ -132,42 +129,60 @@ func (f *fakeDNSProviders) call(name string, args ...interface{}) {
 	f.calls = append(f.calls, fakeDNSProviderCall{name: name, args: args})
 }
 
+type fakeDNSProvider struct {
+	fake *fakeDNSProviders
+	name string
+}
+
+func newFakeProvider(name string, fake *fakeDNSProviders ) *fakeDNSProvider {
+	p:= &fakeDNSProvider{fake,name}
+	fake.providers.Register(name, p)
+	return p
+}
+
+func (p *fakeDNSProvider) Validate(config interface{}, fldPath *field.Path) field.ErrorList {
+	p.fake.call(p.name, config, fldPath)
+	return nil
+}
+
+func (p *fakeDNSProvider) Create(s *Solver, issuer v1alpha1.GenericIssuer, ch *v1alpha1.Challenge, resourceNamespace string, config interface{}) (Interface, error) {
+	p.fake.call(p.name, s, issuer, ch, resourceNamespace, config)
+	return nil, nil
+}
+
+func (p *fakeDNSProvider) ResolverType() reflect.Type {
+	p.fake.call(p.name)
+	return nil
+}
+
 func newFakeDNSProviders() *fakeDNSProviders {
 	f := &fakeDNSProviders{
+		providers: NewRegistry(),
 		calls: []fakeDNSProviderCall{},
 	}
-	f.constructors = dnsProviderConstructors{
-		cloudDNS: func(project string, serviceAccount []byte, dns01Nameservers []string, ambient bool) (*clouddns.DNSProvider, error) {
-			f.call("clouddns", project, serviceAccount, util.RecursiveNameservers, ambient)
-			return nil, nil
-		},
-		cloudFlare: func(email, apikey string, dns01Nameservers []string) (*cloudflare.DNSProvider, error) {
-			f.call("cloudflare", email, apikey, util.RecursiveNameservers)
-			if email == "" || apikey == "" {
-				return nil, errors.New("invalid email or apikey")
-			}
-			return nil, nil
-		},
-		route53: func(accessKey, secretKey, hostedZoneID, region string, ambient bool, dns01Nameservers []string) (*route53.DNSProvider, error) {
-			f.call("route53", accessKey, secretKey, hostedZoneID, region, ambient, util.RecursiveNameservers)
-			return nil, nil
-		},
-		azureDNS: func(clientID, clientSecret, subscriptionID, tenentID, resourceGroupName, hostedZoneName string, dns01Nameservers []string) (*azuredns.DNSProvider, error) {
-			f.call("azuredns", clientID, clientSecret, subscriptionID, tenentID, resourceGroupName, hostedZoneName, util.RecursiveNameservers)
-			return nil, nil
-		},
-		acmeDNS: func(host string, accountJson []byte, dns01Nameservers []string) (*acmedns.DNSProvider, error) {
-			f.call("acmedns", host, accountJson, dns01Nameservers)
-			return nil, nil
-		},
-		rfc2136: func(nameserver, tsigAlgorithm, tsigKeyName, tsigSecret string, dns01Nameservers []string) (*rfc2136.DNSProvider, error) {
-			f.call("rfc2136", nameserver, tsigAlgorithm, tsigKeyName, tsigSecret, util.RecursiveNameservers)
-			return nil, nil
-		},
-		digitalOcean: func(token string, dns01Nameservers []string) (*digitalocean.DNSProvider, error) {
+	newFakeProvider("clouddns", f)
+	newFakeProvider("cloudflare", f)
+	//newFakeProvider("route53", f)
+	newFakeProvider("azuredns", f)
+	newFakeProvider("acmedns", f)
+	newFakeProvider("rfc2136", f)
+	//newFakeProvider("digitalocean", f)
+
+	//f.providers.Register("acmedns", acmedns.NewFactory(
+	//	func(host string, accountJson []byte, dns01Nameservers []string) (*acmedns.DNSProvider, error) {
+	//		f.call("acmedns", host, accountJson, dns01Nameservers)
+	//		return nil, nil
+	//	}))
+	f.providers.Register("digitalocean", digitalocean.NewFactory(
+		func(token string, dns01Nameservers []string) (*digitalocean.DNSProvider, error) {
 			f.call("digitalocean", token, util.RecursiveNameservers)
 			return nil, nil
-		},
-	}
+		}))
+	f.providers.Register("route53", route53.NewFactory(
+		func(accessKey, secretKey, hostedZoneID, region string, ambient bool, dns01Nameservers []string) (*route53.DNSProvider, error) {
+			f.call("route53", accessKey, secretKey, hostedZoneID, region, ambient, util.RecursiveNameservers)
+			return nil, nil
+		}))
+	newFakeProvider("acmedns", f)
 	return f
 }
